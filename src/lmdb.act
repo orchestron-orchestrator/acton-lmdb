@@ -1,0 +1,578 @@
+import file
+import testing
+import random
+
+class LMDBError(Exception):
+    pass
+
+class LMDBKeyError(LMDBError):
+    """Key not found in database"""
+    pass
+
+class LMDBKeySizeError(LMDBError):
+    """Key size exceeds maximum allowed size"""
+    key: bytes
+    max_size: int
+
+    def __init__(self, key: bytes, max_size: int):
+        self.key = key
+        self.max_size = max_size
+        self.error_message = "Key size exceeds maximum"
+
+    def __str__(self) -> str:
+        return "Key size {len(self.key)} exceeds maximum {self.max_size}"
+
+def version() -> str:
+    """Get LMDB version
+    """
+    NotImplemented
+
+actor Db(cap: file.WriteFileCap, path: str, max_size: int=10485760):
+    """LMDB Database actor
+    """
+    var _env: int = 0  # Will hold pointer to MDB_env
+    var _dbi: int = 0  # Will hold database handle
+    var _max_key_size: int = 0  # Maximum allowed key size
+    var _is_open: bool = False
+    var _write_txn_active: bool = False  # Track if write transaction is active
+
+    def open():
+        if _is_open:
+            raise LMDBError("Database already open")
+        res = _env_create_and_open(path, max_size)
+        _env = res.0
+        _dbi = res.1
+        _max_key_size = res.2
+        _is_open = True
+
+    open()
+
+    def put(key: bytes, value: bytes) -> None:
+        if not _is_open:
+            raise LMDBError("Database is closed")
+        if len(key) > _max_key_size:
+            raise LMDBKeySizeError(key, _max_key_size)
+        _put(_env, _dbi, key, value)
+
+    def get(key: bytes) -> ?bytes:
+        if not _is_open:
+            raise LMDBError("Database is closed")
+        if len(key) > _max_key_size:
+            raise LMDBKeySizeError(key, _max_key_size)
+        return _get(_env, _dbi, key)
+
+    def delete(key: bytes) -> bool:
+        if not _is_open:
+            raise LMDBError("Database is closed")
+        if len(key) > _max_key_size:
+            raise LMDBKeySizeError(key, _max_key_size)
+        return _delete(_env, _dbi, key)
+
+    def close():
+        if _is_open:
+            _close(_env, _dbi)
+            _is_open = False
+
+    def __cleanup__():
+        close()
+
+    def begin_read() -> ReadTransaction:
+        if not _is_open:
+            raise LMDBError("Database is closed")
+        return ReadTransaction(_env, _dbi)
+
+    def begin_write() -> WriteTransaction:
+        """Begin a read-write transaction
+        Only one allowed at a time, so the WriteTransaction must call release_txn
+        """
+        if not _is_open:
+            raise LMDBError("Database is closed")
+        if _write_txn_active:
+            raise LMDBError("Write transaction already active")
+        _write_txn_active = True
+
+        def release_txn():
+            _write_txn_active = False
+
+        return WriteTransaction(_env, _dbi, _max_key_size, release_txn)
+
+    def get_max_key_size() -> int:
+        return _max_key_size
+
+actor ReadTransaction(env: int, dbi: int):
+    """Read-only transaction - multiple allowed concurrently
+    """
+    var _txn: int = 0
+    var _committed: bool = False
+    var _aborted: bool = False
+    var _dbi: int = dbi
+
+    _txn = _txn_begin_read(env)
+
+    def get(key: bytes) -> ?bytes:
+        if _committed or _aborted:
+            raise LMDBError("Transaction already finished")
+        return _txn_get(_txn, _dbi, key)
+
+    def cursor() -> ReadCursor:
+        if _committed or _aborted:
+            raise LMDBError("Transaction already finishedd")
+        return ReadCursor(_txn, _dbi)
+
+    def commit():
+        if _committed:
+            return # Idempotent noop
+        if _aborted:
+            raise LMDBError("Transaction already aborted")
+        _txn_commit(_txn)
+        _committed = True
+
+    def abort():
+        if _aborted:
+            return # Idempotent noop
+        if _committed:
+            raise LMDBError("Transaction already committed")
+        _txn_abort(_txn)
+        _aborted = True
+
+    def __cleanup__():
+        if not _committed and not _aborted:
+            abort()
+
+actor WriteTransaction(env: int, dbi: int, max_key_size: int, release_fn: action() -> None):
+    """Read-write transaction - only one allowed at a time"""
+    var _txn: int = 0
+    var _committed: bool = False
+    var _aborted: bool = False
+    var _dbi: int = dbi
+    var _max_key_size: int = max_key_size
+    var _release_fn: action() -> None = release_fn
+
+    _txn = _txn_begin_write(env)
+
+    def put(key: bytes, value: bytes):
+        if _committed or _aborted:
+            raise LMDBError("Transaction already finished")
+        if len(key) > _max_key_size:
+            raise LMDBKeySizeError(key, _max_key_size)
+        _txn_put(_txn, _dbi, key, value)
+
+    def get(key: bytes) -> ?bytes:
+        if _committed or _aborted:
+            raise LMDBError("Transaction already finished")
+        if len(key) > _max_key_size:
+            raise LMDBKeySizeError(key, _max_key_size)
+        return _txn_get(_txn, _dbi, key)
+
+    def delete(key: bytes) -> bool:
+        if _committed or _aborted:
+            raise LMDBError("Transaction already finished")
+        if len(key) > _max_key_size:
+            raise LMDBKeySizeError(key, _max_key_size)
+        return _txn_delete(_txn, _dbi, key)
+
+    def cursor() -> WriteCursor:
+        if _committed or _aborted:
+            raise LMDBError("Transaction already finished")
+        return WriteCursor(_txn, _dbi)
+
+    def commit():
+        if _committed:
+            return # Idempotent noop
+        if _aborted:
+            raise LMDBError("Transaction already aborted")
+        _txn_commit(_txn)
+        _committed = True
+        _release_fn()
+
+    def abort():
+        if _aborted:
+            return # Idempotent noop
+        if _committed:
+            raise LMDBError("Transaction already committed")
+        _txn_abort(_txn)
+        _aborted = True
+        _release_fn()
+
+    def __cleanup__():
+        if not _committed and not _aborted:
+            abort()
+
+actor ReadCursor(txn_ptr: int, dbi: int):
+    """Cursor for read-only iteration over database"""
+    var _cursor: int = 0
+    var _closed: bool = False
+
+    _cursor = _cursor_open(txn_ptr, dbi)
+
+    def first() -> ?(key: bytes, value: bytes):
+        if _closed:
+            raise LMDBError("Cursor is closed")
+        return _cursor_first(_cursor)
+
+    def last() -> ?(key: bytes, value: bytes):
+        if _closed:
+            raise LMDBError("Cursor is closed")
+        return _cursor_last(_cursor)
+
+    def next() -> ?(key: bytes, value: bytes):
+        if _closed:
+            raise LMDBError("Cursor is closed")
+        return _cursor_next(_cursor)
+
+    def prev() -> ?(key: bytes, value: bytes):
+        if _closed:
+            raise LMDBError("Cursor is closed")
+        return _cursor_prev(_cursor)
+
+    def seek(key: bytes) -> ?(key: bytes, value: bytes):
+        if _closed:
+            raise LMDBError("Cursor is closed")
+        return _cursor_seek(_cursor, key)
+
+    def seek_prefix(prefix: bytes) -> ?(key: bytes, value: bytes):
+        if _closed:
+            raise LMDBError("Cursor is closed")
+        return _cursor_seek_prefix(_cursor, prefix)
+
+    def close():
+        if not _closed:
+            _cursor_close(_cursor)
+            _closed = True
+
+    def __cleanup__():
+        close()
+
+actor WriteCursor(txn_ptr: int, dbi: int):
+    """Cursor for read-write iteration and modification"""
+    var _cursor: int = 0
+    var _closed: bool = False
+
+    _cursor = _cursor_open(txn_ptr, dbi)
+
+    def first() -> ?(key: bytes, value: bytes):
+        if _closed:
+            raise LMDBError("Cursor is closed")
+        return _cursor_first(_cursor)
+
+    def last() -> ?(key: bytes, value: bytes):
+        if _closed:
+            raise LMDBError("Cursor is closed")
+        return _cursor_last(_cursor)
+
+    def next() -> ?(key: bytes, value: bytes):
+        if _closed:
+            raise LMDBError("Cursor is closed")
+        return _cursor_next(_cursor)
+
+    def prev() -> ?(key: bytes, value: bytes):
+        if _closed:
+            raise LMDBError("Cursor is closed")
+        return _cursor_prev(_cursor)
+
+    def seek(key: bytes) -> ?(key: bytes, value: bytes):
+        if _closed:
+            raise LMDBError("Cursor is closed")
+        return _cursor_seek(_cursor, key)
+
+    def seek_prefix(prefix: bytes) -> ?(key: bytes, value: bytes):
+        if _closed:
+            raise LMDBError("Cursor is closed")
+        return _cursor_seek_prefix(_cursor, prefix)
+
+    def put(key: bytes, value: bytes):
+        if _closed:
+            raise LMDBError("Cursor is closed")
+        _cursor_put(_cursor, key, value)
+
+    def delete():
+        if _closed:
+            raise LMDBError("Cursor is closed")
+        _cursor_delete(_cursor)
+
+    def close():
+        if not _closed:
+            _cursor_close(_cursor)
+            _closed = True
+
+    def __cleanup__():
+        close()
+
+# C extension functions (implemented in lmdb.ext.c)
+def _env_create_and_open(path: str, max_size: int) -> (int, int, int):
+    """Create environment and open database, returns (env_ptr, dbi, max_key_size)"""
+    NotImplemented
+
+def _put(env: int, dbi: int, key: bytes, value: bytes) -> None:
+    NotImplemented
+
+def _get(env: int, dbi: int, key: bytes) -> ?bytes:
+    NotImplemented
+
+def _delete(env: int, dbi: int, key: bytes) -> bool:
+    NotImplemented
+
+def _close(env: int, dbi: int) -> None:
+    NotImplemented
+
+def _txn_begin_read(env: int) -> int:
+    NotImplemented
+
+def _txn_begin_write(env: int) -> int:
+    NotImplemented
+
+def _txn_commit(txn: int) -> None:
+    NotImplemented
+
+def _txn_abort(txn: int) -> None:
+    NotImplemented
+
+def _txn_put(txn: int, dbi: int, key: bytes, value: bytes) -> None:
+    NotImplemented
+
+def _txn_get(txn: int, dbi: int, key: bytes) -> ?bytes:
+    NotImplemented
+
+def _txn_delete(txn: int, dbi: int, key: bytes) -> bool:
+    NotImplemented
+
+def _cursor_open(txn: int, dbi: int) -> int:
+    NotImplemented
+
+def _cursor_close(cursor: int) -> None:
+    NotImplemented
+
+def _cursor_first(cursor: int) -> ?(key: bytes, value: bytes):
+    NotImplemented
+
+def _cursor_last(cursor: int) -> ?(key: bytes, value: bytes):
+    NotImplemented
+
+def _cursor_next(cursor: int) -> ?(key: bytes, value: bytes):
+    NotImplemented
+
+def _cursor_prev(cursor: int) -> ?(key: bytes, value: bytes):
+    NotImplemented
+
+def _cursor_seek(cursor: int, key: bytes) -> ?(key: bytes, value: bytes):
+    NotImplemented
+
+def _cursor_seek_prefix(cursor: int, prefix: bytes) -> ?(key: bytes, value: bytes):
+    NotImplemented
+
+def _cursor_put(cursor: int, key: bytes, value: bytes) -> None:
+    NotImplemented
+
+def _cursor_delete(cursor: int) -> None:
+    NotImplemented
+
+
+actor _test_db_basic_operations(t: testing.EnvT):
+    db_path = "/tmp/test_lmdb_basic_" + str(random.randint(100000, 999999))
+
+    wfcap = file.WriteFileCap(file.FileCap(t.env.cap))
+    db = Db(wfcap, db_path)
+
+    db.put(b"key1", b"value1")
+    value = db.get(b"key1")
+    testing.assertEqual(value, b"value1", "Should retrieve the value we stored")
+
+    missing = db.get(b"nonexistent")
+    testing.assertEqual(missing, None, "Should return None for missing keys")
+
+    db.put(b"key1", b"updated_value")
+    value = db.get(b"key1")
+    testing.assertEqual(value, b"updated_value", "Should update existing key")
+
+    existed = db.delete(b"key1")
+    testing.assertEqual(existed, True, "Delete should return True for existing key")
+
+    value = db.get(b"key1")
+    testing.assertEqual(value, None, "Deleted key should not exist")
+
+    existed = db.delete(b"nonexistent")
+    testing.assertEqual(existed, False, "Delete should return False for non-existent key")
+
+    await async db.close()
+    fs = file.FS(file.FileCap(t.env.cap))
+    await async fs.rmtree(db_path)
+    await async fs.rmdir(db_path)
+
+    t.success()
+
+actor _test_db_multiple_keys(t: testing.EnvT):
+    db_path = "/tmp/test_lmdb_multi_" + str(random.randint(100000, 999999))
+
+    wfcap = file.WriteFileCap(file.FileCap(t.env.cap))
+    db = Db(wfcap, db_path)
+
+    for i in range(10):
+        key = b"key_" + str(i).encode()
+        value = b"value_" + str(i).encode()
+        db.put(key, value)
+
+    for i in range(10):
+        key = b"key_" + str(i).encode()
+        expected = b"value_" + str(i).encode()
+        value = db.get(key)
+        testing.assertEqual(value, expected, "Should retrieve correct value for key " + str(i))
+
+    await async db.close()
+    fs = file.FS(file.FileCap(t.env.cap))
+    await async fs.rmtree(db_path)
+    await async fs.rmdir(db_path)
+
+    t.success()
+
+actor _test_db_persistence(t: testing.EnvT):
+    unique_id = str(random.randint(100000000, 999999999))
+    db_path = "/tmp/test_lmdb_persist_" + unique_id
+
+    wfcap = file.WriteFileCap(file.FileCap(t.env.cap))
+
+    db1 = Db(wfcap, db_path)
+    db1.put(b"persistent_key", b"persistent_value")
+    await async db1.close()
+
+    # Reopen and verify data is still there
+    db2 = Db(wfcap, db_path)
+    value = db2.get(b"persistent_key")
+    if value != b"persistent_value":
+        print("DEBUG: Value lost after reopen. Path:", db_path, "Got:", value, "Expected: b'persistent_value'")
+    testing.assertEqual(value, b"persistent_value", "Data should persist after close and reopen")
+
+    await async db2.close()
+    fs = file.FS(file.FileCap(t.env.cap))
+    await async fs.rmtree(db_path)
+    await async fs.rmdir(db_path)
+
+    t.success()
+
+actor _test_db_large_values(t: testing.EnvT):
+    db_path = "/tmp/test_lmdb_large_" + str(random.randint(100000, 999999))
+
+    wfcap = file.WriteFileCap(file.FileCap(t.env.cap))
+    db = Db(wfcap, db_path)
+
+    # Create a 1MB value
+    large_value = b"x" * (1024 * 1024)
+    db.put(b"large_key", large_value)
+
+    retrieved = db.get(b"large_key")
+    testing.assertNotNone(retrieved, "Should retrieve large value")
+    if retrieved is not None:
+        testing.assertEqual(len(retrieved), 1024 * 1024, "Should handle 1MB values")
+        testing.assertEqual(retrieved, large_value, "Large value should match")
+
+    await async db.close()
+    fs = file.FS(file.FileCap(t.env.cap))
+    await async fs.rmtree(db_path)
+    await async fs.rmdir(db_path)
+
+    t.success()
+
+actor _test_db_binary_data(t: testing.EnvT):
+    """Test with binary data including null bytes"""
+    db_path = "/tmp/test_lmdb_binary_" + str(random.randint(100000, 999999))
+
+    wfcap = file.WriteFileCap(file.FileCap(t.env.cap))
+    db = Db(wfcap, db_path)
+
+    binary_key = b"\x00\x01\x02\x03\xff"
+    binary_value = b"data\x00with\x00nulls\xff"
+
+    db.put(binary_key, binary_value)
+    retrieved = db.get(binary_key)
+
+    testing.assertEqual(retrieved, binary_value, "Should handle binary data with null bytes")
+
+    # Clean up
+    await async db.close()
+    fs = file.FS(file.FileCap(t.env.cap))
+    await async fs.rmtree(db_path)
+    await async fs.rmdir(db_path)
+
+    t.success()
+
+actor _test_transactions(t: testing.EnvT):
+    db_path = "/tmp/test_lmdb_txn_" + str(random.randint(100000, 999999))
+
+    wfcap = file.WriteFileCap(file.FileCap(t.env.cap))
+    db = Db(wfcap, db_path)
+
+    # Test write transaction
+    txn = db.begin_write()
+    txn.put(b"txn_key1", b"txn_value1")
+    txn.put(b"txn_key2", b"txn_value2")
+
+    # Read within the same transaction should work
+    val = txn.get(b"txn_key1")
+    testing.assertEqual(val, b"txn_value1", "Should read within write transaction")
+
+    await async txn.commit()
+
+    # After commit, values should be persisted
+    val1 = db.get(b"txn_key1")
+    val2 = db.get(b"txn_key2")
+    testing.assertEqual(val1, b"txn_value1", "Committed value 1 should persist")
+    testing.assertEqual(val2, b"txn_value2", "Committed value 2 should persist")
+
+    # Test abort
+    txn2 = db.begin_write()
+    txn2.put(b"abort_key", b"abort_value")
+    await async txn2.abort()
+
+    # After abort, value should not exist
+    aborted = db.get(b"abort_key")
+    testing.assertEqual(aborted, None, "Aborted transaction should not persist")
+
+    await async db.close()
+    fs = file.FS(file.FileCap(t.env.cap))
+    await async fs.rmtree(db_path)
+    await async fs.rmdir(db_path)
+    t.success()
+
+actor _test_cursors(t: testing.EnvT):
+    db_path = "/tmp/test_lmdb_cursor_" + str(random.randint(100000, 999999))
+
+    wfcap = file.WriteFileCap(file.FileCap(t.env.cap))
+    db = Db(wfcap, db_path)
+
+    # Some test data
+    db.put(b"user:001", b"Alice")
+    db.put(b"user:002", b"Bob")
+    db.put(b"user:003", b"Charlie")
+    db.put(b"config:debug", b"true")
+    db.put(b"config:port", b"8080")
+
+    read_txn = db.begin_read()
+    cursor = read_txn.cursor()
+
+    # First item
+    first = cursor.first()
+    testing.assertNotNone(first, "First should not be None")
+    if first is not None:
+        testing.assertEqual(first.key, b"config:debug", "First key should be config:debug")
+        testing.assertEqual(first.value, b"true", "First value should be true")
+
+    # Next item
+    next_item = cursor.next()
+    testing.assertNotNone(next_item, "Next should not be None")
+    if next_item is not None:
+        testing.assertEqual(next_item.key, b"config:port", "Next key should be config:port")
+
+    # Seek to prefix
+    user_item = cursor.seek_prefix(b"user:")
+    testing.assertNotNone(user_item, "Should find user prefix")
+    if user_item is not None:
+        testing.assertEqual(user_item.key, b"user:001", "Should find first user")
+        testing.assertEqual(user_item.value, b"Alice", "Should be Alice")
+
+    await async cursor.close()
+    await async read_txn.commit()
+
+    await async db.close()
+    fs = file.FS(file.FileCap(t.env.cap))
+    await async fs.rmtree(db_path)
+    await async fs.rmdir(db_path)
+    t.success()

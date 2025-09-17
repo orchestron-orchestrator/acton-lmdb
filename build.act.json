@@ -1,0 +1,12 @@
+{
+    "dependencies": {},
+    "zig_dependencies": {
+        "lmdb": {
+            "url": "https://github.com/orchestron-orchestrator/lmdb/archive/2ec2a6efb20d53dd5a7435193ce1eaebbc05c5ff.tar.gz",
+            "hash": "122010ef54b308782a2e150cbde86e9a4d68350e6e10c65c0cfaaa7b4e48f087daed",
+            "artifacts": [
+                "lmdb"
+            ]
+        }
+    }
+}
