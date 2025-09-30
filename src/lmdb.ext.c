@@ -2,6 +2,16 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 
+// LMDB normally uses TLS (thread local storage) for some stuff, which is why
+// LMDB normally should run on one thread and one thread can only open one LMDB
+// database at a time. It's basically as a convenience, like there is nothing to
+// clean up on thread destruction since it's in TLS, and I think sometimes as a
+// slight optimization. It doesn't really do much for us in Acton since we have
+// our own ways of cleaning up and need to interop well with the actor / thread
+// semantics, essentially that actors can migrate between threads and a thread
+// might run any actor so its ultimately forbidden to rely on TLS - programs
+// shouild only rely on actor state!
+
 void lmdbQ___ext_init__() {
 }
 

@@ -1,3 +1,10 @@
+"""LMDB
+
+You must not open the same LMDB database multiple times within the same process.
+This is a limitation of LMDB itself, as it is using advisory file locks to
+manage concurrent access and this breaks down if the same process opens the
+same DB multiple times.
+"""
 import file
 import testing
 import random
@@ -29,6 +36,11 @@ def version() -> str:
 
 actor Db(cap: file.WriteFileCap, path: str, max_size: int=10485760):
     """LMDB Database actor
+
+    Do NOT open the same LMDB database multiple times, concurrently, within the
+    same process. This is a limitation of LMDB itself, as it is using advisory
+    file locks to manage concurrent access and this breaks down if the same
+    process opens the same DB multiple times.
     """
     var _env: int = 0  # Will hold pointer to MDB_env
     var _dbi: int = 0  # Will hold database handle
