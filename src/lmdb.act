@@ -608,3 +608,67 @@ actor _test_cursors(t: testing.EnvT):
     await async fs.rmtree(db_path)
     await async fs.rmdir(db_path)
     t.success()
+
+actor _test_cursor_persistence(t: testing.EnvT):
+    """Test that cursors can read data persisted by a different Db instance"""
+    unique_id = str(random.randint(100000000, 999999999))
+    db_path = "/tmp/test_lmdb_cursor_persist_" + unique_id
+
+    wfcap = file.WriteFileCap(file.FileCap(t.env.cap))
+
+    # Phase 1: Write data with first Db instance
+    db1 = Db(wfcap, db_path)
+    db1.put(b"direct:001", b"DirectValue1")
+    db1.put(b"direct:002", b"DirectValue2")
+
+    write_txn = db1.begin_write()
+    write_txn.put(b"txn:001", b"TxnValue1")
+    write_txn.put(b"txn:002", b"TxnValue2")
+    write_txn.put(b"txn:003", b"TxnValue3")
+    await async write_txn.commit()
+
+    # Verify data is accessible
+    val = db1.get(b"direct:001")
+    testing.assertEqual(val, b"DirectValue1", "First instance should read direct value")
+
+    await async db1.close()
+
+    # Phase 2: Open new Db instance and read with cursors
+    db2 = Db(wfcap, db_path)
+
+    # Verify via direct get first
+    val = db2.get(b"direct:001")
+    testing.assertEqual(val, b"DirectValue1", "Second instance should read direct value")
+
+    # Test with cursor
+    read_txn = db2.begin_read()
+    cursor = read_txn.cursor()
+
+    first = cursor.first()
+    testing.assertNotNone(first, "Cursor.first() should find data from previous instance")
+
+    # Count all items
+    item_count = 0
+    item = cursor.first()
+    while item is not None:
+        item_count += 1
+        item = cursor.next()
+
+    testing.assertEqual(item_count, 5, "Cursor should find all 5 persisted items")
+
+    # Test seek_prefix
+    direct_item = cursor.seek_prefix(b"direct:")
+    testing.assertNotNone(direct_item, "Should find items with direct: prefix")
+
+    txn_item = cursor.seek_prefix(b"txn:")
+    testing.assertNotNone(txn_item, "Should find items with txn: prefix")
+
+    # Cursor is automatically closed when transaction ends
+    await async read_txn.commit()
+    await async db2.close()
+
+    # Clean up
+    fs = file.FS(file.FileCap(t.env.cap))
+    await async fs.rmtree(db_path)
+    await async fs.rmdir(db_path)
+    t.success()
