@@ -132,16 +132,19 @@ B_bytes lmdbQ__get(B_int env_ptr, B_int dbi, B_bytes key) {
     mkey.mv_data = key->str;
 
     rc = mdb_get(txn, (MDB_dbi)from$int(dbi), &mkey, &mval);
-    mdb_txn_abort(txn);  // Read-only txn can be aborted
 
     if (rc == MDB_NOTFOUND) {
+        mdb_txn_abort(txn);  // Safe to abort when no data returned
         return (B_bytes)B_None;
     } else if (rc != 0) {
+        mdb_txn_abort(txn);  // Safe to abort when error occurred
         RAISE(lmdbQ_LMDBError, to$str(mdb_strerror(rc)));
     }
 
-    // Copy the data to return
-    return to$bytesD_len(mval.mv_data, mval.mv_size);
+    // Copy the data BEFORE aborting the transaction
+    B_bytes result = to$bytesD_len(mval.mv_data, mval.mv_size);
+    mdb_txn_abort(txn);  // Now safe to abort after data is copied
+    return result;
 }
 
 B_bool lmdbQ__delete(B_int env_ptr, B_int dbi, B_bytes key) {
