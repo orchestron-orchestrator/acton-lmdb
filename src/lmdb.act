@@ -118,6 +118,7 @@ actor ReadTransaction(env: int, dbi: int):
     var _committed: bool = False
     var _aborted: bool = False
     var _dbi: int = dbi
+    var _cursors: list[ReadCursor] = []
 
     _txn = _txn_begin_read(env)
 
@@ -128,14 +129,23 @@ actor ReadTransaction(env: int, dbi: int):
 
     def cursor() -> ReadCursor:
         if _committed or _aborted:
-            raise LMDBError("Transaction already finishedd")
-        return ReadCursor(_txn, _dbi)
+            raise LMDBError("Transaction already finished")
+        c = ReadCursor(_txn, _dbi)
+        _cursors.append(c)
+        return c
 
     def commit():
         if _committed:
             return # Idempotent noop
         if _aborted:
             raise LMDBError("Transaction already aborted")
+        # Invalidate all cursors before committing
+        msgs = []
+        for c in _cursors:
+            msg = async c.mark_invalid()
+            msgs.append(msg)
+        for msg in msgs:
+            await msg
         _txn_commit(_txn)
         _committed = True
 
@@ -144,6 +154,13 @@ actor ReadTransaction(env: int, dbi: int):
             return # Idempotent noop
         if _committed:
             raise LMDBError("Transaction already committed")
+        # Invalidate all cursors before aborting
+        msgs = []
+        for c in _cursors:
+            msg = async c.mark_invalid()
+            msgs.append(msg)
+        for msg in msgs:
+            await msg
         _txn_abort(_txn)
         _aborted = True
 
@@ -159,6 +176,7 @@ actor WriteTransaction(env: int, dbi: int, max_key_size: int, release_fn: action
     var _dbi: int = dbi
     var _max_key_size: int = max_key_size
     var _release_fn: action() -> None = release_fn
+    var _cursors: list[WriteCursor] = []
 
     _txn = _txn_begin_write(env)
 
@@ -186,13 +204,22 @@ actor WriteTransaction(env: int, dbi: int, max_key_size: int, release_fn: action
     def cursor() -> WriteCursor:
         if _committed or _aborted:
             raise LMDBError("Transaction already finished")
-        return WriteCursor(_txn, _dbi)
+        c = WriteCursor(_txn, _dbi)
+        _cursors.append(c)
+        return c
 
     def commit():
         if _committed:
             return # Idempotent noop
         if _aborted:
             raise LMDBError("Transaction already aborted")
+        # Invalidate all cursors before committing
+        msgs = []
+        for c in _cursors:
+            msg = async c.mark_invalid()
+            msgs.append(msg)
+        for msg in msgs:
+            await msg
         _txn_commit(_txn)
         _committed = True
         _release_fn()
@@ -202,6 +229,13 @@ actor WriteTransaction(env: int, dbi: int, max_key_size: int, release_fn: action
             return # Idempotent noop
         if _committed:
             raise LMDBError("Transaction already committed")
+        # Invalidate all cursors before aborting
+        msgs = []
+        for c in _cursors:
+            msg = async c.mark_invalid()
+            msgs.append(msg)
+        for msg in msgs:
+            await msg
         _txn_abort(_txn)
         _aborted = True
         _release_fn()
@@ -213,102 +247,89 @@ actor WriteTransaction(env: int, dbi: int, max_key_size: int, release_fn: action
 actor ReadCursor(txn_ptr: int, dbi: int):
     """Cursor for read-only iteration over database"""
     var _cursor: int = 0
-    var _closed: bool = False
+    var _valid: bool = True
 
     _cursor = _cursor_open(txn_ptr, dbi)
 
+    def mark_invalid():
+        _valid = False
+        _cursor = 0
+
+    def _check_valid():
+        if not _valid:
+            raise LMDBError("Cursor is no longer valid - transaction has ended")
+
     def first() -> ?(key: bytes, value: bytes):
-        if _closed:
-            raise LMDBError("Cursor is closed")
+        _check_valid()
         return _cursor_first(_cursor)
 
     def last() -> ?(key: bytes, value: bytes):
-        if _closed:
-            raise LMDBError("Cursor is closed")
+        _check_valid()
         return _cursor_last(_cursor)
 
     def next() -> ?(key: bytes, value: bytes):
-        if _closed:
-            raise LMDBError("Cursor is closed")
+        _check_valid()
         return _cursor_next(_cursor)
 
     def prev() -> ?(key: bytes, value: bytes):
-        if _closed:
-            raise LMDBError("Cursor is closed")
+        _check_valid()
         return _cursor_prev(_cursor)
 
     def seek(key: bytes) -> ?(key: bytes, value: bytes):
-        if _closed:
-            raise LMDBError("Cursor is closed")
+        _check_valid()
         return _cursor_seek(_cursor, key)
 
     def seek_prefix(prefix: bytes) -> ?(key: bytes, value: bytes):
-        if _closed:
-            raise LMDBError("Cursor is closed")
+        _check_valid()
         return _cursor_seek_prefix(_cursor, prefix)
-
-    def close():
-        if not _closed:
-            _cursor_close(_cursor)
-            _closed = True
-
-    def __cleanup__():
-        close()
 
 actor WriteCursor(txn_ptr: int, dbi: int):
     """Cursor for read-write iteration and modification"""
     var _cursor: int = 0
-    var _closed: bool = False
+    var _valid: bool = True
 
     _cursor = _cursor_open(txn_ptr, dbi)
 
+    def mark_invalid():
+        _valid = False
+        _cursor = 0
+
+    def _check_valid():
+        if not _valid:
+            raise LMDBError("Cursor is no longer valid - transaction has ended")
+
     def first() -> ?(key: bytes, value: bytes):
-        if _closed:
-            raise LMDBError("Cursor is closed")
+        _check_valid()
         return _cursor_first(_cursor)
 
     def last() -> ?(key: bytes, value: bytes):
-        if _closed:
-            raise LMDBError("Cursor is closed")
+        _check_valid()
         return _cursor_last(_cursor)
 
     def next() -> ?(key: bytes, value: bytes):
-        if _closed:
-            raise LMDBError("Cursor is closed")
+        _check_valid()
         return _cursor_next(_cursor)
 
     def prev() -> ?(key: bytes, value: bytes):
-        if _closed:
-            raise LMDBError("Cursor is closed")
+        _check_valid()
         return _cursor_prev(_cursor)
 
     def seek(key: bytes) -> ?(key: bytes, value: bytes):
-        if _closed:
-            raise LMDBError("Cursor is closed")
+        _check_valid()
         return _cursor_seek(_cursor, key)
 
     def seek_prefix(prefix: bytes) -> ?(key: bytes, value: bytes):
-        if _closed:
-            raise LMDBError("Cursor is closed")
+        _check_valid()
         return _cursor_seek_prefix(_cursor, prefix)
 
     def put(key: bytes, value: bytes):
-        if _closed:
-            raise LMDBError("Cursor is closed")
+        _check_valid()
         _cursor_put(_cursor, key, value)
 
     def delete():
-        if _closed:
-            raise LMDBError("Cursor is closed")
+        _check_valid()
         _cursor_delete(_cursor)
 
-    def close():
-        if not _closed:
-            _cursor_close(_cursor)
-            _closed = True
-
-    def __cleanup__():
-        close()
 
 # C extension functions (implemented in lmdb.ext.c)
 def _env_create_and_open(path: str, max_size: int) -> (int, int, int):
@@ -580,7 +601,6 @@ actor _test_cursors(t: testing.EnvT):
         testing.assertEqual(user_item.key, b"user:001", "Should find first user")
         testing.assertEqual(user_item.value, b"Alice", "Should be Alice")
 
-    await async cursor.close()
     await async read_txn.commit()
 
     await async db.close()

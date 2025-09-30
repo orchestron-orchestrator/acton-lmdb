@@ -51,7 +51,9 @@ B_tuple lmdbQ__env_create_and_open(B_str path, B_int max_size) {
     // Create directory if it doesn't exist
     mkdir(cpath, 0755);
 
-    rc = mdb_env_open(env, cpath, 0, 0664);
+    // Use MDB_NOTLS to avoid thread-local storage, which is fundamentally
+    // incompatible with Acton RTS worker and actor scheduling semantics
+    rc = mdb_env_open(env, cpath, MDB_NOTLS, 0664);
     if (rc != 0) {
         mdb_env_close(env);
         RAISE(lmdbQ_LMDBError, to$str(mdb_strerror(rc)));
