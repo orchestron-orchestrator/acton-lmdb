@@ -175,7 +175,7 @@ B_bytes lmdbQ_libQ__get(int64_t env_ptr, int64_t dbi, B_bytes key) {
     return result;
 }
 
-B_bool lmdbQ_libQ__delete(int64_t env_ptr, int64_t dbi, B_bytes key) {
+bool lmdbQ_libQ__delete(int64_t env_ptr, int64_t dbi, B_bytes key) {
     MDB_env *env = (MDB_env*)(intptr_t)env_ptr;
     MDB_txn *txn;
     MDB_val mkey;
@@ -192,7 +192,7 @@ B_bool lmdbQ_libQ__delete(int64_t env_ptr, int64_t dbi, B_bytes key) {
     rc = mdb_del(txn, (MDB_dbi)dbi, &mkey, NULL);
     if (rc == MDB_NOTFOUND) {
         mdb_txn_abort(txn);
-        return B_False;
+        return false;
     } else if (rc != 0) {
         mdb_txn_abort(txn);
         raise_lmdb_error("mdb_del", rc);
@@ -203,7 +203,7 @@ B_bool lmdbQ_libQ__delete(int64_t env_ptr, int64_t dbi, B_bytes key) {
         raise_lmdb_error("mdb_txn_commit(delete)", rc);
     }
 
-    return B_True;
+    return true;
 }
 
 B_NoneType lmdbQ_libQ__close(int64_t env_ptr, int64_t dbi) {
@@ -292,7 +292,7 @@ B_bytes lmdbQ_libQ__txn_get(int64_t txn_ptr, int64_t dbi, B_bytes key) {
     return to$bytesD_len(mval.mv_data, mval.mv_size);
 }
 
-B_bool lmdbQ_libQ__txn_delete(int64_t txn_ptr, int64_t dbi, B_bytes key) {
+bool lmdbQ_libQ__txn_delete(int64_t txn_ptr, int64_t dbi, B_bytes key) {
     MDB_txn *txn = (MDB_txn*)(intptr_t)txn_ptr;
     MDB_val mkey;
 
@@ -301,11 +301,11 @@ B_bool lmdbQ_libQ__txn_delete(int64_t txn_ptr, int64_t dbi, B_bytes key) {
 
     int rc = mdb_del(txn, (MDB_dbi)dbi, &mkey, NULL);
     if (rc == MDB_NOTFOUND) {
-        return B_False;
+        return false;
     } else if (rc != 0) {
         raise_lmdb_error("mdb_del(txn)", rc);
     }
-    return B_True;
+    return true;
 }
 
 // Cursor functions
