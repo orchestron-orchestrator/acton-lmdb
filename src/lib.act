@@ -11,6 +11,10 @@ import testing
 class Error(Exception):
     pass
 
+class InvalidStateError(Error):
+    """Operation is invalid for the object's current lifecycle state"""
+    pass
+
 class KeyExistsError(Error):
     """Key/data pair already exists"""
     pass
@@ -147,7 +151,7 @@ actor Db(cap: file.WriteFileCap, path: str, max_size: int=10485760):
 
     def open():
         if _is_open:
-            raise Error("Database already open")
+            raise InvalidStateError("Database already open")
         res = _env_create_and_open(path, max_size)
         _env = res.0
         _dbi = res.1
@@ -158,25 +162,25 @@ actor Db(cap: file.WriteFileCap, path: str, max_size: int=10485760):
 
     def put(key: bytes, value: bytes) -> None:
         if not _is_open:
-            raise Error("Database is closed")
+            raise InvalidStateError("Database is closed")
         if _write_txn_active:
-            raise Error("Cannot use Db.put while write transaction is active")
+            raise InvalidStateError("Cannot use Db.put while write transaction is active")
         if len(key) > _max_key_size:
             raise KeySizeError(key, _max_key_size)
         _put(_env, _dbi, key, value)
 
     def get(key: bytes) -> ?bytes:
         if not _is_open:
-            raise Error("Database is closed")
+            raise InvalidStateError("Database is closed")
         if len(key) > _max_key_size:
             raise KeySizeError(key, _max_key_size)
         return _get(_env, _dbi, key)
 
     def delete(key: bytes) -> bool:
         if not _is_open:
-            raise Error("Database is closed")
+            raise InvalidStateError("Database is closed")
         if _write_txn_active:
-            raise Error("Cannot use Db.delete while write transaction is active")
+            raise InvalidStateError("Cannot use Db.delete while write transaction is active")
         if len(key) > _max_key_size:
             raise KeySizeError(key, _max_key_size)
         return _delete(_env, _dbi, key)
@@ -184,7 +188,7 @@ actor Db(cap: file.WriteFileCap, path: str, max_size: int=10485760):
     def close():
         if _is_open:
             if _read_txn_count > 0 or _write_txn_active or len(_write_txn_waiters) > 0:
-                raise Error("Cannot close database while transactions are active")
+                raise InvalidStateError("Cannot close database while transactions are active")
             _close(_env, _dbi)
             _is_open = False
 
@@ -193,7 +197,7 @@ actor Db(cap: file.WriteFileCap, path: str, max_size: int=10485760):
 
     def begin_read() -> ReadTransaction:
         if not _is_open:
-            raise Error("Database is closed")
+            raise InvalidStateError("Database is closed")
         _read_txn_count += 1
 
         def release_txn():
@@ -233,9 +237,9 @@ actor Db(cap: file.WriteFileCap, path: str, max_size: int=10485760):
         Only one allowed at a time, so the WriteTransaction must call release_txn
         """
         if not _is_open:
-            raise Error("Database is closed")
+            raise InvalidStateError("Database is closed")
         if _write_txn_active or len(_write_txn_waiters) > 0:
-            raise Error("Write transaction already active")
+            raise InvalidStateError("Write transaction already active")
         return _new_write_txn()
 
     def request_write(done: action(?Exception, ?WriteTransaction) -> None) -> None:
@@ -247,7 +251,7 @@ actor Db(cap: file.WriteFileCap, path: str, max_size: int=10485760):
         invoked with either a WriteTransaction or an Exception.
         """
         if not _is_open:
-            done(Error("Database is closed"), None)
+            done(InvalidStateError("Database is closed"), None)
             return
         _write_txn_waiters.append(done)
         _dispatch_waiting_write_txn()
@@ -270,12 +274,12 @@ actor ReadTransaction(env: int, dbi: int, release_fn: action() -> None):
 
     def get(key: bytes) -> ?bytes:
         if _committed or _aborted:
-            raise Error("Transaction already finished")
+            raise InvalidStateError("Transaction already finished")
         return _txn_get(_txn, _dbi, key)
 
     def cursor() -> ReadCursor:
         if _committed or _aborted:
-            raise Error("Transaction already finished")
+            raise InvalidStateError("Transaction already finished")
         c = ReadCursor(_txn, _dbi)
         _cursors.append(c)
         return c
@@ -299,7 +303,7 @@ actor ReadTransaction(env: int, dbi: int, release_fn: action() -> None):
         if _committed:
             return # Idempotent noop
         if _aborted:
-            raise Error("Transaction already aborted")
+            raise InvalidStateError("Transaction already aborted")
         commit_started = False
         try:
             _close_cursors()
@@ -318,7 +322,7 @@ actor ReadTransaction(env: int, dbi: int, release_fn: action() -> None):
         if _aborted:
             return # Idempotent noop
         if _committed:
-            raise Error("Transaction already committed")
+            raise InvalidStateError("Transaction already committed")
         try:
             _close_cursors()
         except Exception as e:
@@ -335,7 +339,12 @@ actor ReadTransaction(env: int, dbi: int, release_fn: action() -> None):
             abort()
 
 actor WriteTransaction(env: int, dbi: int, max_key_size: int, release_fn: action() -> None):
-    """Read-write transaction - only one allowed at a time"""
+    """Read-write transaction - only one allowed at a time.
+
+    A native mutation failure aborts the transaction and releases its writer
+    slot before the original error is returned. Later messages sent to the
+    transaction fail with InvalidStateError.
+    """
     var _txn: int = 0
     var _committed: bool = False
     var _aborted: bool = False
@@ -354,29 +363,41 @@ actor WriteTransaction(env: int, dbi: int, max_key_size: int, release_fn: action
 
     def put(key: bytes, value: bytes):
         if _committed or _aborted:
-            raise Error("Transaction already finished")
+            raise InvalidStateError("Transaction already finished")
         if len(key) > _max_key_size:
             raise KeySizeError(key, _max_key_size)
-        _txn_put(_txn, _dbi, key, value)
+        try:
+            _txn_put(_txn, _dbi, key, value)
+        except Error as e:
+            _abort_failed()
+            raise e
 
     def get(key: bytes) -> ?bytes:
         if _committed or _aborted:
-            raise Error("Transaction already finished")
+            raise InvalidStateError("Transaction already finished")
         if len(key) > _max_key_size:
             raise KeySizeError(key, _max_key_size)
         return _txn_get(_txn, _dbi, key)
 
     def delete(key: bytes) -> bool:
         if _committed or _aborted:
-            raise Error("Transaction already finished")
+            raise InvalidStateError("Transaction already finished")
         if len(key) > _max_key_size:
             raise KeySizeError(key, _max_key_size)
-        return _txn_delete(_txn, _dbi, key)
+        try:
+            return _txn_delete(_txn, _dbi, key)
+        except Error as e:
+            _abort_failed()
+            raise e
 
     def cursor() -> WriteCursor:
         if _committed or _aborted:
-            raise Error("Transaction already finished")
-        c = WriteCursor(_txn, _dbi, _affinity_wtid)
+            raise InvalidStateError("Transaction already finished")
+
+        def fail_txn():
+            _abort_failed()
+
+        c = WriteCursor(_txn, _dbi, _affinity_wtid, fail_txn)
         _cursors.append(c)
         return c
 
@@ -395,11 +416,24 @@ actor WriteTransaction(env: int, dbi: int, max_key_size: int, release_fn: action
             await msg
         _cursors = []
 
+    def _abort_failed():
+        if _committed or _aborted:
+            return
+        try:
+            _close_cursors()
+        except Exception:
+            # Native abort still invalidates every write cursor. Preserve the
+            # mutation error that explains why the transaction was aborted.
+            pass
+        _txn_abort(_txn)
+        _aborted = True
+        _release_once()
+
     def commit():
         if _committed:
             return # Idempotent noop
         if _aborted:
-            raise Error("Transaction already aborted")
+            raise InvalidStateError("Transaction already aborted")
         commit_started = False
         try:
             _close_cursors()
@@ -418,7 +452,7 @@ actor WriteTransaction(env: int, dbi: int, max_key_size: int, release_fn: action
         if _aborted:
             return # Idempotent noop
         if _committed:
-            raise Error("Transaction already committed")
+            raise InvalidStateError("Transaction already committed")
         try:
             _close_cursors()
         except Exception as e:
@@ -452,7 +486,7 @@ actor ReadCursor(txn_ptr: int, dbi: int):
 
     def _check_valid():
         if not _valid:
-            raise Error("Cursor is no longer valid - transaction has ended")
+            raise InvalidStateError("Cursor is no longer valid - transaction has ended")
 
     def first() -> ?(key: bytes, value: bytes):
         _check_valid()
@@ -481,12 +515,16 @@ actor ReadCursor(txn_ptr: int, dbi: int):
     def __cleanup__():
         close()
 
-actor WriteCursor(txn_ptr: int, dbi: int, affinity_wtid: int):
-    """Cursor for read-write iteration and modification"""
+actor WriteCursor(txn_ptr: int, dbi: int, affinity_wtid: int, failure_fn: action() -> None):
+    """Cursor for read-write iteration and modification.
+
+    A native mutation failure schedules an abort on the owning transaction.
+    """
     var _cursor: int = 0
     var _txn_ptr: int = txn_ptr
     var _dbi: int = dbi
     var _valid: bool = True
+    var _failure_fn: action() -> None = failure_fn
 
     proc def _set_affinity(wtid: int) -> None:
         NotImplemented
@@ -507,8 +545,13 @@ actor WriteCursor(txn_ptr: int, dbi: int, affinity_wtid: int):
 
     def _check_valid():
         if not _valid:
-            raise Error("Cursor is no longer valid - transaction has ended")
+            raise InvalidStateError("Cursor is no longer valid - transaction has ended")
         _ensure_open()
+
+    def _schedule_failed_txn_abort():
+        # Do not await this callback: the owner closes this cursor while
+        # aborting, so waiting here would deadlock the two actors.
+        abort_msg = async _failure_fn()
 
     def first() -> ?(key: bytes, value: bytes):
         _check_valid()
@@ -536,11 +579,19 @@ actor WriteCursor(txn_ptr: int, dbi: int, affinity_wtid: int):
 
     def put(key: bytes, value: bytes):
         _check_valid()
-        _cursor_put(_cursor, key, value)
+        try:
+            _cursor_put(_cursor, key, value)
+        except Error as e:
+            _schedule_failed_txn_abort()
+            raise e
 
     def delete():
         _check_valid()
-        _cursor_delete(_cursor)
+        try:
+            _cursor_delete(_cursor)
+        except Error as e:
+            _schedule_failed_txn_abort()
+            raise e
 
     def __cleanup__():
         close()
@@ -825,16 +876,15 @@ actor _test_error_types_and_transaction_recovery(t: testing.EnvT):
     """Verify typed LMDB errors and recovery after failed writes.
 
     The test covers wrapper and native value-size failures, then dirties a
-    deliberately small environment and exceeds its map size. LMDB invalidates
-    that transaction, so a later write should raise BadTxnError. Aborting must
-    discard the earlier dirty write and release the database for a subsequent
-    successful transaction.
+    deliberately small environment and exceeds its map size. The failed write
+    must abort its transaction, discard earlier writes, and release the writer
+    slot. The same cleanup guarantee must hold for write-cursor failures.
     """
     fc = file.FileCap(t.env.cap)
     fs = file.FS(fc)
     db_path = fs.mktmpdir("test_lmdb_map_full_")
     wfcap = file.WriteFileCap(fc)
-    db = Db(wfcap, db_path, 64 * 1024)
+    db = Db(wfcap, db_path, 256 * 1024)
 
     key_size_raised = False
     try:
@@ -859,32 +909,57 @@ actor _test_error_types_and_transaction_recovery(t: testing.EnvT):
 
     map_full_raised = False
     try:
-        await async txn.put(b"large", b"x" * (128 * 1024))
+        await async txn.put(b"large", b"x" * (512 * 1024))
     except MapFullError as e:
         map_full_raised = True
         testing.assertTrue("mdb_put(txn): MDB_MAP_FULL" in str(e), "Map-full error should retain LMDB operation context")
     testing.assertTrue(map_full_raised, "Exceeding the environment map should raise MapFullError")
 
-    bad_txn_raised = False
+    invalid_state_raised = False
     try:
         await async txn.put(b"invalid", b"value")
-    except BadTxnError as e:
-        bad_txn_raised = True
-        testing.assertTrue("mdb_put(txn): MDB_BAD_TXN" in str(e), "Bad-transaction error should retain LMDB operation context")
-    testing.assertTrue(bad_txn_raised, "Writing after MDB_MAP_FULL should raise BadTxnError")
+    except InvalidStateError as e:
+        invalid_state_raised = True
+        testing.assertTrue("Transaction already finished" in str(e), "An automatically aborted transaction should reject later writes")
+    testing.assertTrue(invalid_state_raised, "Writing after MDB_MAP_FULL should raise InvalidStateError")
 
-    await async txn.abort()
-    testing.assertEqual(db.get(b"discarded"), None, "Aborting the failed transaction should discard earlier writes")
+    testing.assertEqual(db.get(b"discarded"), None, "A failed write should automatically discard earlier writes")
 
     recovery_txn = db.begin_write()
     await async recovery_txn.put(b"recovered", b"value")
     await async recovery_txn.commit()
-    testing.assertEqual(db.get(b"recovered"), b"value", "A new transaction should succeed after aborting the failed one")
+    testing.assertEqual(db.get(b"recovered"), b"value", "A new transaction should succeed after automatic abort")
 
-    await async db.close()
-    await async fs.rmtree(db_path)
-    await async fs.rmdir(db_path)
-    t.success()
+    cursor_txn = db.begin_write()
+    await async cursor_txn.put(b"cursor_discarded", b"value")
+    cursor = cursor_txn.cursor()
+
+    cursor_map_full_raised = False
+    try:
+        await async cursor.put(b"cursor_large", b"x" * (512 * 1024))
+    except MapFullError as e:
+        cursor_map_full_raised = True
+        testing.assertTrue("mdb_cursor_put: MDB_MAP_FULL" in str(e), "Cursor map-full error should retain LMDB operation context")
+    testing.assertTrue(cursor_map_full_raised, "Exceeding the map through a cursor should raise MapFullError")
+
+    def cursor_recovery(err: ?Exception, txn: ?WriteTransaction):
+        if err is not None:
+            raise AssertionError("Writer request after cursor failure should not fail, got {err}")
+        if txn is not None:
+            testing.assertEqual(db.get(b"cursor_discarded"), None, "A failed cursor write should discard earlier transaction writes")
+            recovery = txn
+            recovery.put(b"cursor_recovered", b"value")
+            await async recovery.commit()
+            testing.assertEqual(db.get(b"cursor_recovered"), b"value", "A cursor failure should release the writer slot")
+
+            await async db.close()
+            await async fs.rmtree(db_path)
+            await async fs.rmdir(db_path)
+            t.success()
+            return
+        raise AssertionError("Writer request after cursor failure returned neither transaction nor error")
+
+    db.request_write(cursor_recovery)
 
 actor _test_queued_write_requests(t: testing.EnvT):
     """Verify that queued write requests are granted in FIFO order.
@@ -1083,14 +1158,14 @@ actor _test_write_path_guard_while_txn_active(t: testing.EnvT):
     put_guarded = False
     try:
         await async db.put(b"b", b"2")
-    except Error:
+    except InvalidStateError:
         put_guarded = True
     testing.assertTrue(put_guarded, "Db.put should fail while explicit write transaction is active")
 
     delete_guarded = False
     try:
         await async db.delete(b"a")
-    except Error:
+    except InvalidStateError:
         delete_guarded = True
     testing.assertTrue(delete_guarded, "Db.delete should fail while explicit write transaction is active")
 
@@ -1122,7 +1197,7 @@ actor _test_close_fails_with_active_transactions(t: testing.EnvT):
     read_close_guarded = False
     try:
         await async db.close()
-    except Error:
+    except InvalidStateError:
         read_close_guarded = True
     testing.assertTrue(read_close_guarded, "Db.close should fail while read transactions are active")
     await async read_txn.abort()
@@ -1132,7 +1207,7 @@ actor _test_close_fails_with_active_transactions(t: testing.EnvT):
     write_close_guarded = False
     try:
         await async db.close()
-    except Error:
+    except InvalidStateError:
         write_close_guarded = True
     testing.assertTrue(write_close_guarded, "Db.close should fail while write transaction is active")
     await async write_txn.abort()
@@ -1167,7 +1242,7 @@ actor _test_cursor_invalid_after_transaction_end(t: testing.EnvT):
     read_cursor_invalid = False
     try:
         await async rc.next()
-    except Error:
+    except InvalidStateError:
         read_cursor_invalid = True
     testing.assertTrue(read_cursor_invalid, "Read cursor should be invalid after transaction commit")
 
@@ -1179,7 +1254,7 @@ actor _test_cursor_invalid_after_transaction_end(t: testing.EnvT):
     write_cursor_invalid = False
     try:
         await async wc.next()
-    except Error:
+    except InvalidStateError:
         write_cursor_invalid = True
     testing.assertTrue(write_cursor_invalid, "Write cursor should be invalid after transaction abort")
 
