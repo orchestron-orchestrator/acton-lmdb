@@ -1,4 +1,5 @@
 #include <lmdb.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -21,7 +22,34 @@ void lmdbQ_libQ___ext_init__() {
 static void raise_lmdb_error(const char *op, int rc) {
     char error_buf[256];
     snprintf(error_buf, sizeof(error_buf), "%s: %s (%d)", op, mdb_strerror(rc), rc);
-    RAISE(lmdbQ_libQ_LMDBError, to$str(error_buf));
+    switch (rc) {
+    case MDB_KEYEXIST: RAISE(lmdbQ_libQ_KeyExistsError, to$str(error_buf));
+    case MDB_NOTFOUND: RAISE(lmdbQ_libQ_NotFoundError, to$str(error_buf));
+    case MDB_PAGE_NOTFOUND: RAISE(lmdbQ_libQ_PageNotFoundError, to$str(error_buf));
+    case MDB_CORRUPTED: RAISE(lmdbQ_libQ_CorruptedError, to$str(error_buf));
+    case MDB_PANIC: RAISE(lmdbQ_libQ_PanicError, to$str(error_buf));
+    case MDB_VERSION_MISMATCH: RAISE(lmdbQ_libQ_VersionMismatchError, to$str(error_buf));
+    case MDB_INVALID: RAISE(lmdbQ_libQ_InvalidError, to$str(error_buf));
+    case MDB_MAP_FULL: RAISE(lmdbQ_libQ_MapFullError, to$str(error_buf));
+    case MDB_DBS_FULL: RAISE(lmdbQ_libQ_DbsFullError, to$str(error_buf));
+    case MDB_READERS_FULL: RAISE(lmdbQ_libQ_ReadersFullError, to$str(error_buf));
+    case MDB_TLS_FULL: RAISE(lmdbQ_libQ_TlsFullError, to$str(error_buf));
+    case MDB_TXN_FULL: RAISE(lmdbQ_libQ_TxnFullError, to$str(error_buf));
+    case MDB_CURSOR_FULL: RAISE(lmdbQ_libQ_CursorFullError, to$str(error_buf));
+    case MDB_PAGE_FULL: RAISE(lmdbQ_libQ_PageFullError, to$str(error_buf));
+    case MDB_MAP_RESIZED: RAISE(lmdbQ_libQ_MapResizedError, to$str(error_buf));
+    case MDB_INCOMPATIBLE: RAISE(lmdbQ_libQ_IncompatibleError, to$str(error_buf));
+    case MDB_BAD_RSLOT: RAISE(lmdbQ_libQ_BadRslotError, to$str(error_buf));
+    case MDB_BAD_DBI: RAISE(lmdbQ_libQ_BadDbiError, to$str(error_buf));
+    case MDB_BAD_TXN: RAISE(lmdbQ_libQ_BadTxnError, to$str(error_buf));
+    case MDB_BAD_VALSIZE: RAISE(lmdbQ_libQ_BadValsizeError, to$str(error_buf));
+    case EACCES: RAISE(lmdbQ_libQ_ReadonlyError, to$str(error_buf));
+    case EINVAL: RAISE(lmdbQ_libQ_InvalidParameterError, to$str(error_buf));
+    case EAGAIN: RAISE(lmdbQ_libQ_LockError, to$str(error_buf));
+    case ENOMEM: RAISE(lmdbQ_libQ_MemoryError, to$str(error_buf));
+    case ENOSPC: RAISE(lmdbQ_libQ_DiskError, to$str(error_buf));
+    default: RAISE(lmdbQ_libQ_Error, to$str(error_buf));
+    }
 }
 
 /* Method dispatch target for proc def _pin_affinity() in WriteTransaction */

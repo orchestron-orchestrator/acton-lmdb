@@ -8,14 +8,110 @@ same DB multiple times.
 import file
 import testing
 
-class LMDBError(Exception):
+class Error(Exception):
     pass
 
-class LMDBKeyError(LMDBError):
-    """Key not found in database"""
+class KeyExistsError(Error):
+    """Key/data pair already exists"""
     pass
 
-class LMDBKeySizeError(LMDBError):
+class NotFoundError(Error):
+    """No matching key/data pair was found"""
+    pass
+
+class PageNotFoundError(Error):
+    """Requested page was not found"""
+    pass
+
+class CorruptedError(Error):
+    """Located page was of the wrong type"""
+    pass
+
+class PanicError(Error):
+    """Environment had a fatal error"""
+    pass
+
+class VersionMismatchError(Error):
+    """Database environment version mismatch"""
+    pass
+
+class InvalidError(Error):
+    """File is not a valid LMDB database"""
+    pass
+
+class MapFullError(Error):
+    """Environment map size limit reached"""
+    pass
+
+class DbsFullError(Error):
+    """Environment database limit reached"""
+    pass
+
+class ReadersFullError(Error):
+    """Environment reader limit reached"""
+    pass
+
+class TlsFullError(Error):
+    """Thread-local storage key limit reached"""
+    pass
+
+class TxnFullError(Error):
+    """Transaction has too many dirty pages"""
+    pass
+
+class CursorFullError(Error):
+    """Cursor stack limit reached"""
+    pass
+
+class PageFullError(Error):
+    """Page has insufficient space"""
+    pass
+
+class MapResizedError(Error):
+    """Database grew beyond the environment map size"""
+    pass
+
+class IncompatibleError(Error):
+    """Operation and database are incompatible"""
+    pass
+
+class BadRslotError(Error):
+    """Invalid reuse of a reader lock-table slot"""
+    pass
+
+class BadDbiError(Error):
+    """Database handle changed unexpectedly"""
+    pass
+
+class BadTxnError(Error):
+    """Transaction must abort or is otherwise invalid"""
+    pass
+
+class BadValsizeError(Error):
+    """Unsupported key, database name, or value size"""
+    pass
+
+class ReadonlyError(Error):
+    """Attempted to modify a read-only database"""
+    pass
+
+class InvalidParameterError(Error):
+    """Invalid parameter passed to LMDB"""
+    pass
+
+class LockError(Error):
+    """Environment lock could not be acquired"""
+    pass
+
+class MemoryError(Error):
+    """Memory allocation failed"""
+    pass
+
+class DiskError(Error):
+    """Disk space exhausted"""
+    pass
+
+class KeySizeError(BadValsizeError):
     """Key size exceeds maximum allowed size"""
     key: bytes
     max_size: int
@@ -51,7 +147,7 @@ actor Db(cap: file.WriteFileCap, path: str, max_size: int=10485760):
 
     def open():
         if _is_open:
-            raise LMDBError("Database already open")
+            raise Error("Database already open")
         res = _env_create_and_open(path, max_size)
         _env = res.0
         _dbi = res.1
@@ -62,33 +158,33 @@ actor Db(cap: file.WriteFileCap, path: str, max_size: int=10485760):
 
     def put(key: bytes, value: bytes) -> None:
         if not _is_open:
-            raise LMDBError("Database is closed")
+            raise Error("Database is closed")
         if _write_txn_active:
-            raise LMDBError("Cannot use Db.put while write transaction is active")
+            raise Error("Cannot use Db.put while write transaction is active")
         if len(key) > _max_key_size:
-            raise LMDBKeySizeError(key, _max_key_size)
+            raise KeySizeError(key, _max_key_size)
         _put(_env, _dbi, key, value)
 
     def get(key: bytes) -> ?bytes:
         if not _is_open:
-            raise LMDBError("Database is closed")
+            raise Error("Database is closed")
         if len(key) > _max_key_size:
-            raise LMDBKeySizeError(key, _max_key_size)
+            raise KeySizeError(key, _max_key_size)
         return _get(_env, _dbi, key)
 
     def delete(key: bytes) -> bool:
         if not _is_open:
-            raise LMDBError("Database is closed")
+            raise Error("Database is closed")
         if _write_txn_active:
-            raise LMDBError("Cannot use Db.delete while write transaction is active")
+            raise Error("Cannot use Db.delete while write transaction is active")
         if len(key) > _max_key_size:
-            raise LMDBKeySizeError(key, _max_key_size)
+            raise KeySizeError(key, _max_key_size)
         return _delete(_env, _dbi, key)
 
     def close():
         if _is_open:
             if _read_txn_count > 0 or _write_txn_active or len(_write_txn_waiters) > 0:
-                raise LMDBError("Cannot close database while transactions are active")
+                raise Error("Cannot close database while transactions are active")
             _close(_env, _dbi)
             _is_open = False
 
@@ -97,7 +193,7 @@ actor Db(cap: file.WriteFileCap, path: str, max_size: int=10485760):
 
     def begin_read() -> ReadTransaction:
         if not _is_open:
-            raise LMDBError("Database is closed")
+            raise Error("Database is closed")
         _read_txn_count += 1
 
         def release_txn():
@@ -137,9 +233,9 @@ actor Db(cap: file.WriteFileCap, path: str, max_size: int=10485760):
         Only one allowed at a time, so the WriteTransaction must call release_txn
         """
         if not _is_open:
-            raise LMDBError("Database is closed")
+            raise Error("Database is closed")
         if _write_txn_active or len(_write_txn_waiters) > 0:
-            raise LMDBError("Write transaction already active")
+            raise Error("Write transaction already active")
         return _new_write_txn()
 
     def request_write(done: action(?Exception, ?WriteTransaction) -> None) -> None:
@@ -151,7 +247,7 @@ actor Db(cap: file.WriteFileCap, path: str, max_size: int=10485760):
         invoked with either a WriteTransaction or an Exception.
         """
         if not _is_open:
-            done(LMDBError("Database is closed"), None)
+            done(Error("Database is closed"), None)
             return
         _write_txn_waiters.append(done)
         _dispatch_waiting_write_txn()
@@ -174,12 +270,12 @@ actor ReadTransaction(env: int, dbi: int, release_fn: action() -> None):
 
     def get(key: bytes) -> ?bytes:
         if _committed or _aborted:
-            raise LMDBError("Transaction already finished")
+            raise Error("Transaction already finished")
         return _txn_get(_txn, _dbi, key)
 
     def cursor() -> ReadCursor:
         if _committed or _aborted:
-            raise LMDBError("Transaction already finished")
+            raise Error("Transaction already finished")
         c = ReadCursor(_txn, _dbi)
         _cursors.append(c)
         return c
@@ -203,7 +299,7 @@ actor ReadTransaction(env: int, dbi: int, release_fn: action() -> None):
         if _committed:
             return # Idempotent noop
         if _aborted:
-            raise LMDBError("Transaction already aborted")
+            raise Error("Transaction already aborted")
         commit_started = False
         try:
             _close_cursors()
@@ -222,7 +318,7 @@ actor ReadTransaction(env: int, dbi: int, release_fn: action() -> None):
         if _aborted:
             return # Idempotent noop
         if _committed:
-            raise LMDBError("Transaction already committed")
+            raise Error("Transaction already committed")
         try:
             _close_cursors()
         except Exception as e:
@@ -258,28 +354,28 @@ actor WriteTransaction(env: int, dbi: int, max_key_size: int, release_fn: action
 
     def put(key: bytes, value: bytes):
         if _committed or _aborted:
-            raise LMDBError("Transaction already finished")
+            raise Error("Transaction already finished")
         if len(key) > _max_key_size:
-            raise LMDBKeySizeError(key, _max_key_size)
+            raise KeySizeError(key, _max_key_size)
         _txn_put(_txn, _dbi, key, value)
 
     def get(key: bytes) -> ?bytes:
         if _committed or _aborted:
-            raise LMDBError("Transaction already finished")
+            raise Error("Transaction already finished")
         if len(key) > _max_key_size:
-            raise LMDBKeySizeError(key, _max_key_size)
+            raise KeySizeError(key, _max_key_size)
         return _txn_get(_txn, _dbi, key)
 
     def delete(key: bytes) -> bool:
         if _committed or _aborted:
-            raise LMDBError("Transaction already finished")
+            raise Error("Transaction already finished")
         if len(key) > _max_key_size:
-            raise LMDBKeySizeError(key, _max_key_size)
+            raise KeySizeError(key, _max_key_size)
         return _txn_delete(_txn, _dbi, key)
 
     def cursor() -> WriteCursor:
         if _committed or _aborted:
-            raise LMDBError("Transaction already finished")
+            raise Error("Transaction already finished")
         c = WriteCursor(_txn, _dbi, _affinity_wtid)
         _cursors.append(c)
         return c
@@ -303,7 +399,7 @@ actor WriteTransaction(env: int, dbi: int, max_key_size: int, release_fn: action
         if _committed:
             return # Idempotent noop
         if _aborted:
-            raise LMDBError("Transaction already aborted")
+            raise Error("Transaction already aborted")
         commit_started = False
         try:
             _close_cursors()
@@ -322,7 +418,7 @@ actor WriteTransaction(env: int, dbi: int, max_key_size: int, release_fn: action
         if _aborted:
             return # Idempotent noop
         if _committed:
-            raise LMDBError("Transaction already committed")
+            raise Error("Transaction already committed")
         try:
             _close_cursors()
         except Exception as e:
@@ -356,7 +452,7 @@ actor ReadCursor(txn_ptr: int, dbi: int):
 
     def _check_valid():
         if not _valid:
-            raise LMDBError("Cursor is no longer valid - transaction has ended")
+            raise Error("Cursor is no longer valid - transaction has ended")
 
     def first() -> ?(key: bytes, value: bytes):
         _check_valid()
@@ -411,7 +507,7 @@ actor WriteCursor(txn_ptr: int, dbi: int, affinity_wtid: int):
 
     def _check_valid():
         if not _valid:
-            raise LMDBError("Cursor is no longer valid - transaction has ended")
+            raise Error("Cursor is no longer valid - transaction has ended")
         _ensure_open()
 
     def first() -> ?(key: bytes, value: bytes):
@@ -725,6 +821,71 @@ actor _test_transactions(t: testing.EnvT):
     await async fs.rmdir(db_path)
     t.success()
 
+actor _test_error_types_and_transaction_recovery(t: testing.EnvT):
+    """Verify typed LMDB errors and recovery after failed writes.
+
+    The test covers wrapper and native value-size failures, then dirties a
+    deliberately small environment and exceeds its map size. LMDB invalidates
+    that transaction, so a later write should raise BadTxnError. Aborting must
+    discard the earlier dirty write and release the database for a subsequent
+    successful transaction.
+    """
+    fc = file.FileCap(t.env.cap)
+    fs = file.FS(fc)
+    db_path = fs.mktmpdir("test_lmdb_map_full_")
+    wfcap = file.WriteFileCap(fc)
+    db = Db(wfcap, db_path, 64 * 1024)
+
+    key_size_raised = False
+    try:
+        await async db.put(b"k" * (db.get_max_key_size() + 1), b"value")
+    except KeySizeError as e:
+        key_size_raised = True
+        testing.assertTrue(isinstance(e, BadValsizeError), "KeySizeError should specialize BadValsizeError")
+        testing.assertTrue(isinstance(e, Error), "KeySizeError should specialize Error")
+    testing.assertTrue(key_size_raised, "An oversized key should raise KeySizeError")
+
+    bad_value_size_raised = False
+    try:
+        await async db.put(b"", b"value")
+    except BadValsizeError as e:
+        bad_value_size_raised = True
+        testing.assertTrue(isinstance(e, Error), "BadValsizeError should specialize Error")
+        testing.assertTrue("mdb_put: MDB_BAD_VALSIZE" in str(e), "Bad-value-size error should retain LMDB operation context")
+    testing.assertTrue(bad_value_size_raised, "An empty LMDB key should raise BadValsizeError")
+
+    txn = db.begin_write()
+    await async txn.put(b"discarded", b"value")
+
+    map_full_raised = False
+    try:
+        await async txn.put(b"large", b"x" * (128 * 1024))
+    except MapFullError as e:
+        map_full_raised = True
+        testing.assertTrue("mdb_put(txn): MDB_MAP_FULL" in str(e), "Map-full error should retain LMDB operation context")
+    testing.assertTrue(map_full_raised, "Exceeding the environment map should raise MapFullError")
+
+    bad_txn_raised = False
+    try:
+        await async txn.put(b"invalid", b"value")
+    except BadTxnError as e:
+        bad_txn_raised = True
+        testing.assertTrue("mdb_put(txn): MDB_BAD_TXN" in str(e), "Bad-transaction error should retain LMDB operation context")
+    testing.assertTrue(bad_txn_raised, "Writing after MDB_MAP_FULL should raise BadTxnError")
+
+    await async txn.abort()
+    testing.assertEqual(db.get(b"discarded"), None, "Aborting the failed transaction should discard earlier writes")
+
+    recovery_txn = db.begin_write()
+    await async recovery_txn.put(b"recovered", b"value")
+    await async recovery_txn.commit()
+    testing.assertEqual(db.get(b"recovered"), b"value", "A new transaction should succeed after aborting the failed one")
+
+    await async db.close()
+    await async fs.rmtree(db_path)
+    await async fs.rmdir(db_path)
+    t.success()
+
 actor _test_queued_write_requests(t: testing.EnvT):
     """Verify that queued write requests are granted in FIFO order.
 
@@ -922,14 +1083,14 @@ actor _test_write_path_guard_while_txn_active(t: testing.EnvT):
     put_guarded = False
     try:
         await async db.put(b"b", b"2")
-    except LMDBError:
+    except Error:
         put_guarded = True
     testing.assertTrue(put_guarded, "Db.put should fail while explicit write transaction is active")
 
     delete_guarded = False
     try:
         await async db.delete(b"a")
-    except LMDBError:
+    except Error:
         delete_guarded = True
     testing.assertTrue(delete_guarded, "Db.delete should fail while explicit write transaction is active")
 
@@ -961,7 +1122,7 @@ actor _test_close_fails_with_active_transactions(t: testing.EnvT):
     read_close_guarded = False
     try:
         await async db.close()
-    except LMDBError:
+    except Error:
         read_close_guarded = True
     testing.assertTrue(read_close_guarded, "Db.close should fail while read transactions are active")
     await async read_txn.abort()
@@ -971,7 +1132,7 @@ actor _test_close_fails_with_active_transactions(t: testing.EnvT):
     write_close_guarded = False
     try:
         await async db.close()
-    except LMDBError:
+    except Error:
         write_close_guarded = True
     testing.assertTrue(write_close_guarded, "Db.close should fail while write transaction is active")
     await async write_txn.abort()
@@ -1006,7 +1167,7 @@ actor _test_cursor_invalid_after_transaction_end(t: testing.EnvT):
     read_cursor_invalid = False
     try:
         await async rc.next()
-    except LMDBError:
+    except Error:
         read_cursor_invalid = True
     testing.assertTrue(read_cursor_invalid, "Read cursor should be invalid after transaction commit")
 
@@ -1018,7 +1179,7 @@ actor _test_cursor_invalid_after_transaction_end(t: testing.EnvT):
     write_cursor_invalid = False
     try:
         await async wc.next()
-    except LMDBError:
+    except Error:
         write_cursor_invalid = True
     testing.assertTrue(write_cursor_invalid, "Write cursor should be invalid after transaction abort")
 
